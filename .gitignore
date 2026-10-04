@@ -1,0 +1,24 @@
+# Секреты — ни в коем случае не коммитить
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+*secret*
+*secrets*
+*.key
+*.pem
+
+# Логи и временные файлы
+*.log
+userbot.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Личные переписки — не коммитить в репозиторий
+messages.json
