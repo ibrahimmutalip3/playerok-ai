@@ -5,7 +5,8 @@
 1. should_reply — решает, есть ли смысл вмешаться в разговор.
 2. generate_reply — генерирует НОВЫЙ ответ с учётом контекста и стиля.
 
-При любой ошибке AI функции возвращают None, и сообщение просто пропускается.
+При любой ошибке AI функции возвращают None/False, а причина сохраняется
+в last_error в виде короткого кода (без ключей и без текста ответа API).
 Никогда не подставляется случайный или заготовленный текст.
 """
 
@@ -19,7 +20,33 @@ from logger import register_secret
 
 
 class AIError(Exception):
-    pass
+    """Ошибка AI. Текст исключения — короткий код причины, например 'insufficient_quota'."""
+
+
+# Понятные пояснения к кодам ошибок (для логов на русском).
+HINTS = {
+    "invalid_api_key": (
+        "неверный API-ключ (AI_API_KEY). Проверьте, что ключ скопирован полностью, без пробелов и кавычек"
+    ),
+    "http_401": "доступ запрещён (401). Проверьте AI_API_KEY",
+    "insufficient_quota": (
+        "на API-аккаунте закончились средства или не подключён способ оплаты. "
+        "Подписка ChatGPT Plus НЕ даёт баланса API: пополните API на platform.openai.com (раздел Billing)"
+    ),
+    "rate_limit_exceeded": "слишком много запросов к AI, бот подождёт и повторит позже",
+    "http_429": "слишком много запросов или нет средств на API-балансе (429)",
+    "model_not_found": "модель AI_MODEL не найдена или недоступна для этого ключа",
+    "http_404": "адрес API не найден (404). Проверьте AI_BASE_URL",
+    "timeout": "AI не ответил вовремя (можно увеличить AI_TIMEOUT)",
+    "network_error": "нет связи с AI_BASE_URL (проверьте адрес и интернет)",
+    "bad_response": "AI вернул ответ в непонятном формате",
+}
+
+
+def describe_error(code: str | None) -> str:
+    if not code:
+        return "неизвестная ошибка AI"
+    return HINTS.get(code, f"ошибка AI ({code})")
 
 
 @dataclass
@@ -66,6 +93,20 @@ def _format_context(lines: list[ChatLine]) -> str:
     return "\n".join(out)
 
 
+def _parse_error(resp: httpx.Response) -> tuple[str | None, str | None]:
+    """Достаёт из ответа API только код ошибки и имя параметра (без текста сообщения)."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, None
+    if not isinstance(data, dict) or not isinstance(data.get("error"), dict):
+        return None, None
+    err = data["error"]
+    code = err.get("code") or err.get("type")
+    param = err.get("param")
+    return (str(code) if code else None), (str(param) if param else None)
+
+
 class AIClient:
     def __init__(self, api_key: str, base_url: str, model: str, timeout: float):
         if not api_key:
@@ -75,6 +116,7 @@ class AIClient:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._client = httpx.AsyncClient(timeout=timeout)
+        self.last_error: str | None = None
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -87,27 +129,53 @@ class AIClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        try:
-            resp = await self._client.post(url, headers=_auth_headers(self._api_key), json=payload)
-        except httpx.TimeoutException as exc:
-            raise AIError("timeout") from exc
-        except httpx.HTTPError as exc:
-            raise AIError("network_error") from exc
 
-        if resp.status_code == 429:
-            raise AIError("rate_limit")
-        if resp.status_code >= 400:
-            # Тело ответа не логируем целиком, чтобы не утечь лишним данным.
-            raise AIError(f"api_error_{resp.status_code}")
+        for attempt in range(2):
+            try:
+                resp = await self._client.post(url, headers=_auth_headers(self._api_key), json=payload)
+            except httpx.TimeoutException as exc:
+                raise AIError("timeout") from exc
+            except httpx.HTTPError as exc:
+                raise AIError("network_error") from exc
 
+            if resp.status_code >= 400:
+                code, param = _parse_error(resp)
+                # Некоторые модели не принимают отдельные параметры (например, max_tokens
+                # или temperature). Один раз адаптируем запрос и повторяем.
+                if attempt == 0 and resp.status_code == 400 and param in ("max_tokens", "temperature"):
+                    if param == "max_tokens":
+                        payload["max_completion_tokens"] = payload.pop("max_tokens")
+                    else:
+                        payload.pop("temperature", None)
+                    continue
+                if code:
+                    raise AIError(code)
+                raise AIError(f"http_{resp.status_code}")
+
+            try:
+                data = resp.json()
+                return data["choices"][0]["message"]["content"] or ""
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                raise AIError("bad_response") from exc
+
+        raise AIError("bad_response")
+
+    async def health_check(self) -> tuple[bool, str]:
+        """Проверка при старте: отвечает ли AI с текущими настройками. Возвращает (ok, пояснение)."""
         try:
-            data = resp.json()
-            return data["choices"][0]["message"]["content"] or ""
-        except (ValueError, KeyError, IndexError) as exc:
-            raise AIError("bad_response") from exc
+            await self._chat(
+                [{"role": "user", "content": "Ответь одним словом: ок"}],
+                temperature=0.0,
+                max_tokens=5,
+            )
+        except AIError as exc:
+            self.last_error = str(exc)
+            return False, describe_error(str(exc))
+        self.last_error = None
+        return True, f"модель {self._model} отвечает"
 
     async def should_reply(self, lines: list[ChatLine], style_hint: str) -> tuple[bool, str]:
-        """Возвращает (нужно_ли_отвечать, краткая_причина). При ошибке — (False, ...)."""
+        """Возвращает (нужно_ли_отвечать, причина). При ошибке AI — (False, 'ai_error:<код>')."""
         system = (
             "Ты решаешь, стоит ли участнику чата вмешаться в разговор прямо сейчас. "
             "Отвечай ТОЛЬКО JSON вида {\"reply\": true|false, \"reason\": \"...\"}. "
@@ -125,11 +193,13 @@ class AIClient:
                 max_tokens=120,
             )
         except AIError as exc:
+            self.last_error = str(exc)
             return False, f"ai_error:{exc}"
 
         parsed = _safe_json(raw)
         if not parsed or not isinstance(parsed.get("reply"), bool):
             return False, "unparseable_decision"
+        self.last_error = None
         return parsed["reply"], str(parsed.get("reason", ""))[:200]
 
     async def generate_reply(
@@ -156,15 +226,21 @@ class AIClient:
                 temperature=0.9,
                 max_tokens=300,
             )
-        except AIError:
+        except AIError as exc:
+            self.last_error = str(exc)
             return None
 
         parsed = _safe_json(raw)
         if not parsed or not isinstance(parsed.get("messages"), list):
+            self.last_error = "bad_response"
             return None
         messages = [m.strip() for m in parsed["messages"] if isinstance(m, str) and m.strip()]
         messages = [m[:500] for m in messages[:3]]
-        return messages or None
+        if not messages:
+            self.last_error = "bad_response"
+            return None
+        self.last_error = None
+        return messages
 
 
 def _safe_json(raw: str) -> dict | None:

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 from telethon import events
 
-from ai import AIClient, ChatLine
+from ai import AIClient, ChatLine, describe_error
 from config import Settings, load_settings
 from logger import setup_logger
 from style import build_style_profile
@@ -108,6 +108,16 @@ class Userbot:
         await self.bot.ensure_authorized(use_qr=self.s.auth_method != "phone")
         await self.bot.resolve_playerok_chat(self.s.playerok_chat_id)
 
+        ai_ok, ai_info = await self.ai.health_check()
+        if ai_ok:
+            self.log.info("AI проверен: %s.", ai_info)
+        else:
+            self.log.error(
+                "AI недоступен при старте: %s. Бот запущен, но ответы будут пропускаться, "
+                "пока проблема не будет исправлена.",
+                ai_info,
+            )
+
         client = self.bot.client
         # Обработчик группы: фильтр по конкретному чату на уровне Telethon...
         client.add_event_handler(
@@ -188,7 +198,7 @@ class Userbot:
         command = text[1:].split()[0] if len(text) > 1 else ""
         answer = self.handle_command(command)
         try:
-            await self.bot.client.send_message(event.chat_id, answer)
+            await event.reply(answer)
         except Exception as exc:  # noqa: BLE001
             self.log.error("Не удалось ответить на команду: %s", type(exc).__name__)
 
@@ -346,7 +356,9 @@ class Userbot:
         should, reason = await self.ai.should_reply(lines, self.style_hint)
         if reason.startswith("ai_error"):
             self.stats.ai_errors += 1
-            self.log.warning("AI временно недоступен — сообщение пропущено.")
+            self.log.warning(
+                "AI недоступен: %s — сообщение пропущено.", describe_error(self.ai.last_error)
+            )
             return
         if not should:
             self.stats.skipped += 1
@@ -364,7 +376,9 @@ class Userbot:
             candidates = await self.ai.generate_reply(lines, self.style_hint, list(self.recent_replies))
         if candidates is None:
             self.stats.ai_errors += 1
-            self.log.warning("AI не вернул ответ — сообщение пропущено.")
+            self.log.warning(
+                "AI не вернул ответ: %s — сообщение пропущено.", describe_error(self.ai.last_error)
+            )
             return
         if any(self._too_similar(c) for c in candidates):
             self.stats.skipped += 1
