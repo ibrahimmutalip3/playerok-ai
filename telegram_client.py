@@ -10,6 +10,7 @@
 
 import asyncio
 import getpass
+import os
 import time
 
 from telethon import TelegramClient, errors
@@ -17,6 +18,9 @@ from telethon.tl.types import Channel, Chat, User
 from telethon.utils import get_peer_id
 
 from logger import register_secret
+
+# Файл, в который сохраняется QR-код для входа (удаляется после входа).
+QR_IMAGE_FILE = "login_qr.png"
 
 
 class TelegramBotError(Exception):
@@ -81,33 +85,63 @@ class TelegramBot:
                        self._session_path)
 
     async def _login_qr(self, attempts: int = 5) -> None:
-        """Вход по QR-коду. QR-код выводится только в терминал, не в лог."""
+        """
+        Вход по QR-коду. QR сохраняется в PNG-файл QR_IMAGE_FILE,
+        который удобно открыть в браузере (в том числе с телефона).
+        Файл удаляется после входа, так как он содержит токен входа.
+        """
         try:
             import qrcode  # type: ignore
         except ImportError as exc:
             raise TelegramBotError("не установлен пакет qrcode") from exc
 
-        for attempt in range(1, attempts + 1):
-            qr_login = await self.client.qr_login()
-            print("\n=== Отсканируйте QR-код в Telegram: Настройки -> Устройства -> Подключить устройство ===")
-            qr = qrcode.QRCode(border=1)
-            qr.add_data(qr_login.url)
-            qr.print_ascii(invert=True)
-            print("Ожидаю сканирования (QR обновляется примерно каждые 30 секунд)...\n")
+        try:
+            for attempt in range(1, attempts + 1):
+                qr_login = await self.client.qr_login()
+                self._save_qr_png(qrcode, qr_login.url)
 
-            try:
-                await qr_login.wait(timeout=30)
-                return
-            except asyncio.TimeoutError:
-                self._log.info("QR-код истёк, генерирую новый (попытка %d из %d).", attempt, attempts)
-                continue
-            except errors.SessionPasswordNeededError:
-                await self._submit_2fa()
-                return
-            except errors.RPCError as exc:
-                raise TelegramBotError(type(exc).__name__) from exc
+                print("\n=== QR-код сохранён в файл: " + QR_IMAGE_FILE + " ===")
+                print("Откройте этот файл в редакторе Codespaces (левая панель -> " + QR_IMAGE_FILE + ")")
+                print("или скачайте его и откройте на другом устройстве.")
+                print("Затем в Telegram аккаунта-твинка:")
+                print("  Настройки -> Устройства -> Подключить устройство -> отсканируйте QR.")
+                print("QR обновляется примерно каждые 30 секунд.\n")
 
-        raise TelegramBotError("QR-код не был отсканирован вовремя")
+                try:
+                    await qr_login.wait(timeout=30)
+                    return
+                except asyncio.TimeoutError:
+                    self._log.info("QR-код истёк, генерирую новый (попытка %d из %d).", attempt, attempts)
+                    continue
+                except errors.SessionPasswordNeededError:
+                    await self._submit_2fa()
+                    return
+                except errors.RPCError as exc:
+                    raise TelegramBotError(type(exc).__name__) from exc
+
+            raise TelegramBotError("QR-код не был отсканирован вовремя")
+        finally:
+            # QR содержит токен входа — не оставляем файл на диске.
+            self._remove_qr_png()
+
+    @staticmethod
+    def _save_qr_png(qrcode_module, url: str) -> None:
+        """Сохраняет QR-код в PNG. Если Pillow не установлен — понятная ошибка."""
+        try:
+            image = qrcode_module.make(url, box_size=10, border=4)
+            image.save(QR_IMAGE_FILE)
+        except Exception as exc:  # например, нет пакета Pillow
+            raise TelegramBotError(
+                "не удалось сохранить QR в PNG (проверьте, что установлен пакет pillow)"
+            ) from exc
+
+    @staticmethod
+    def _remove_qr_png() -> None:
+        try:
+            if os.path.exists(QR_IMAGE_FILE):
+                os.remove(QR_IMAGE_FILE)
+        except OSError:
+            pass
 
     async def _submit_2fa(self) -> None:
         """Запрашивает облачный пароль 2FA. Пароль нигде не сохраняется и не логируется."""
